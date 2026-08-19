@@ -30,7 +30,9 @@ var i18n = function (options) {
    _domain = options.domain || defaults.domain,
    _dictionary = {},
    _plural_forms = {},
-   _ctxt_delimiter = options.ctxt_delimiter || defaults.ctxt_delimiter;
+   _ctxt_delimiter = options.ctxt_delimiter || defaults.ctxt_delimiter,
+   _gettext_strfmt = options.gettext_strfmt,
+   _jsep = options.jsep;
 
    if (options.messages) {
      _dictionary[_domain] = {};
@@ -88,6 +90,121 @@ var i18n = function (options) {
       return locale;
    };
 
+   // jsep (https://github.com/soney/jsep) turns an expression into an AST without going
+   // through eval(), which lets us interpret plural forms under a Content Security Policy
+   // that does not allow 'unsafe-eval'. It is optional: hand it over through the jsep
+   // option, or expose it as a global (its browser build does that on its own when loaded
+   // with a <script> tag). When it is nowhere to be found we fall back to new Function().
+   var resolveJsep = function (candidate) {
+     if (!candidate)
+       return false;
+
+     // jsep's default export is directly callable, an ESM namespace object is not
+     if ('function' === typeof candidate)
+       return candidate;
+
+     if ('function' === typeof candidate.default)
+       return candidate.default;
+
+     if ('function' === typeof candidate.parse)
+       return function (expression) { return candidate.parse(expression); };
+
+     return false;
+   };
+
+   var getJsep = function () {
+     var global_scope =
+       'undefined' !== typeof globalThis ? globalThis :
+       'undefined' !== typeof window ? window :
+       'undefined' !== typeof self ? self : false;
+
+     return resolveJsep(_jsep) || resolveJsep(global_scope && global_scope.jsep);
+   };
+
+   // Operators reachable through the plural form regexp below, all computed with plain JS
+   // semantics so that results stay identical to what new Function() used to hand back.
+   // && || and ?? are handled apart from these, they must keep short circuiting
+   var plural_binary_ops = {
+     '|':   function (l, r) { return l | r; },
+     '^':   function (l, r) { return l ^ r; },
+     '&':   function (l, r) { return l & r; },
+     '==':  function (l, r) { return l == r; },
+     '!=':  function (l, r) { return l != r; },
+     '===': function (l, r) { return l === r; },
+     '!==': function (l, r) { return l !== r; },
+     '<':   function (l, r) { return l < r; },
+     '>':   function (l, r) { return l > r; },
+     '<=':  function (l, r) { return l <= r; },
+     '>=':  function (l, r) { return l >= r; },
+     '<<':  function (l, r) { return l << r; },
+     '>>':  function (l, r) { return l >> r; },
+     '>>>': function (l, r) { return l >>> r; },
+     '+':   function (l, r) { return l + r; },
+     '-':   function (l, r) { return l - r; },
+     '*':   function (l, r) { return l * r; },
+     '/':   function (l, r) { return l / r; },
+     '%':   function (l, r) { return l % r; },
+     '**':  function (l, r) { return Math.pow(l, r); }
+   };
+
+   var plural_unary_ops = {
+     '!': function (v) { return !v; },
+     '-': function (v) { return -v; },
+     '+': function (v) { return +v; },
+     '~': function (v) { return ~v; }
+   };
+
+   // Walks the AST jsep produced for a plural expression. Only the nodes a plural form can
+   // legitimately be made of are understood, anything else is refused rather than computed
+   var evalPluralNode = function (node, n) {
+     if (!node || 'string' !== typeof node.type)
+       throw new Error('Malformed plural form expression');
+
+     if ('Literal' === node.type)
+       return node.value;
+
+     if ('Identifier' === node.type) {
+       if ('n' !== node.name)
+         throw new Error(strfmt('Unknown identifier "%1" in plural form expression', node.name));
+
+       return n;
+     }
+
+     if ('UnaryExpression' === node.type) {
+       if (!plural_unary_ops[node.operator])
+         throw new Error(strfmt('Unsupported operator "%1" in plural form expression', node.operator));
+
+       return plural_unary_ops[node.operator](evalPluralNode(node.argument, n));
+     }
+
+     // jsep up to 1.3 reports && and || as LogicalExpression, 1.4 and later as BinaryExpression
+     if ('BinaryExpression' === node.type || 'LogicalExpression' === node.type) {
+       if ('&&' === node.operator)
+         return evalPluralNode(node.left, n) && evalPluralNode(node.right, n);
+
+       if ('||' === node.operator)
+         return evalPluralNode(node.left, n) || evalPluralNode(node.right, n);
+
+       if ('??' === node.operator) {
+         var left = evalPluralNode(node.left, n);
+         return (null === left || undefined === left) ? evalPluralNode(node.right, n) : left;
+       }
+
+       if (!plural_binary_ops[node.operator])
+         throw new Error(strfmt('Unsupported operator "%1" in plural form expression', node.operator));
+
+       return plural_binary_ops[node.operator](evalPluralNode(node.left, n), evalPluralNode(node.right, n));
+     }
+
+     if ('ConditionalExpression' === node.type)
+       return evalPluralNode(node.test, n) ? evalPluralNode(node.consequent, n) : evalPluralNode(node.alternate, n);
+
+     throw new Error(strfmt('Unsupported expression "%1" in plural form', node.type));
+   };
+
+   // Pulls the plural count and the plural expression out of an already validated plural form
+   var pf_parts_re = /^\s*nplurals\s*=\s*([0-9]+)\s*;\s*plural\s*=\s*([\s\S]*?)\s*;*\s*$/;
+
    var getPluralFunc = function (plural_form) {
      // Plural form string regexp
      // taken from https://github.com/Orange-OpenSource/gettext.js/blob/master/lib.gettext.js
@@ -99,21 +216,48 @@ var i18n = function (options) {
      if (!match || match[0] !== plural_form)
        throw new Error(strfmt('The plural form "%1" is not valid', plural_form));
 
-     console.log('>>> Plural form:', plural_form);
+     var jsep = getJsep();
 
-     // Careful here, this is a hidden eval() equivalent..
+     // Preferred path: parse the expression once, then walk that AST on every call. No
+     // eval() equivalent is involved, so a CSP without 'unsafe-eval' is enough
+     if (jsep) {
+       var nplurals, ast;
+
+       try {
+         var parts = plural_form.match(pf_parts_re);
+         nplurals = parseInt(parts[1], 10);
+         ast = jsep(parts[2]);
+       } catch (e) {
+         throw new Error(strfmt('The plural form "%1" is not valid', plural_form));
+       }
+
+       // jsep answers with an empty Compound for an empty expression, and with a filled one
+       // for anything it read as several expressions in a row
+       if ('Compound' === ast.type)
+         throw new Error(strfmt('The plural form "%1" is not valid', plural_form));
+
+       return function (n) {
+         var plural = evalPluralNode(ast, n);
+
+         return { nplurals: nplurals, plural: (plural === true ? 1 : (plural ? plural : 0)) };
+       };
+     }
+
+     // Fallback for when jsep is not around. Careful here, this is a hidden eval() equivalent
+     // and it does need CSP 'unsafe-eval': pass the jsep option to stay clear of it.
      // Risk should be reasonable though since we test the plural_form through regex before
      // taken from https://github.com/Orange-OpenSource/gettext.js/blob/master/lib.gettext.js
-     // TODO: should test if https://github.com/soney/jsep present and use it if so
      return new Function("n", 'var plural, nplurals; '+ plural_form +' return { nplurals: nplurals, plural: (plural === true ? 1 : (plural ? plural : 0)) };');
    };
 
    // Proper translation function that handle plurals and directives
    // Contains juicy parts of https://github.com/Orange-OpenSource/gettext.js/blob/master/lib.gettext.js
    var t = function (messages, n, options /* ,extra */) {
+     var formatter = _gettext_strfmt || strfmt;
+
      // Singular is very easy, just pass dictionnary message through strfmt
      if (!options.plural_form)
-      return strfmt.apply(this, [removeContext(messages[0])].concat(Array.prototype.slice.call(arguments, 3)));
+      return formatter.apply(this, [removeContext(messages[0])].concat(Array.prototype.slice.call(arguments, 3)));
 
      var plural;
 
@@ -135,7 +279,7 @@ var i18n = function (options) {
      if ('undefined' === typeof plural.plural || plural.plural > plural.nplurals || messages.length <= plural.plural)
        plural.plural = 0;
 
-     return strfmt.apply(this, [removeContext(messages[plural.plural])].concat(Array.prototype.slice.call(arguments, 3)));
+     return formatter.apply(this, [removeContext(messages[plural.plural])].concat(Array.prototype.slice.call(arguments, 3)));
    };
 
  return {
