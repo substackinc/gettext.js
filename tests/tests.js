@@ -424,14 +424,14 @@
                     i, i18n, message;
 
                 for (i = 0; i < invalid.length; i++) {
-                    i18n = apples(new window.i18n({ locale: 'foo', jsep: stub_jsep }), 'foo', unvalid[i]);
+                    i18n = apples(new window.i18n({ locale: 'foo', jsep: stub_jsep }), 'foo', invalid[i]);
                     message = null;
                     try {
                         i18n.ngettext('%1 apple', '%1 apples', 42, 42);
                     } catch (e) {
                         message = e.message;
                     }
-                    expect(message).to.be('The plural form "' + unvalid[i] + '" is not valid');
+                    expect(message).to.be('The plural form "' + invalid[i] + '" is not valid');
                 }
             });
 
@@ -448,22 +448,32 @@
                 expect(message).to.be('The plural form "nplurals=2; plural=;" is not valid');
             });
 
-            it('should refuse anything but n in a plural expression', function () {
+            it('should refuse an identifier other than n', function () {
                 var other_identifier = function () { return { type: 'Identifier', name: 'pwned' }; },
-                    a_call = function () { return { type: 'CallExpression', callee: n_node, arguments: [] }; },
-                    parsers = [other_identifier, a_call],
-                    i, i18n, message;
-
-                for (i = 0; i < parsers.length; i++) {
-                    i18n = apples(new window.i18n({ locale: 'foo', jsep: parsers[i] }), 'foo', 'nplurals=2; plural=n;');
+                    i18n = apples(new window.i18n({ locale: 'foo', jsep: other_identifier }), 'foo', 'nplurals=2; plural=n;'),
                     message = null;
-                    try {
-                        i18n.ngettext('%1 apple', '%1 apples', 42, 42);
-                    } catch (e) {
-                        message = e.message;
-                    }
-                    expect(message).to.not.be(null);
+
+                try {
+                    i18n.ngettext('%1 apple', '%1 apples', 42, 42);
+                } catch (e) {
+                    message = e.message;
                 }
+
+                expect(message).to.be('Unknown identifier "pwned" in plural form expression');
+            });
+
+            it('should refuse a function call in a plural expression', function () {
+                var a_call = function () { return { type: 'CallExpression', callee: n_node, arguments: [] }; },
+                    i18n = apples(new window.i18n({ locale: 'foo', jsep: a_call }), 'foo', 'nplurals=2; plural=n;'),
+                    message = null;
+
+                try {
+                    i18n.ngettext('%1 apple', '%1 apples', 42, 42);
+                } catch (e) {
+                    message = e.message;
+                }
+
+                expect(message).to.be('Unsupported expression "CallExpression" in plural form');
             });
 
             it('should parse a plural form only once per locale', function () {
