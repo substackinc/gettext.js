@@ -3,7 +3,7 @@
   "version": "2.0.3",
   "license": "MIT",
   "scripts": {
-    "test": "karma start tests/karma.config.js && node tests/po2json.test.js",
+    "test": "karma start tests/karma.config.js && node tests/plural.test.js && node tests/po2json.test.js",
     "test-dev": "karma start tests/karma.config.dev.js",
     "build": "./node_modules/.bin/gulp"
   },
@@ -13,8 +13,17 @@
   "dependencies": {
     "po2json": "^1.0.0-beta-3"
   },
+  "peerDependencies": {
+    "jsep": "^1.0.0"
+  },
+  "peerDependenciesMeta": {
+    "jsep": {
+      "optional": true
+    }
+  },
   "devDependencies": {
     "del": "latest",
+    "jsep": "^1.4.0",
     "gulp": "^4.0.0",
     "gulp-better-rollup": "latest",
     "gulp-rename": "^1.2.2",

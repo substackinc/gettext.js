@@ -334,5 +334,160 @@
                 });
             });
         });
+
+        // The real jsep is ES6 and cannot be loaded in the browser this suite runs in, so the
+        // parser is stubbed here with something that answers the AST jsep would have produced.
+        describe('plural forms with jsep', function () {
+            var n_node = { type: 'Identifier', name: 'n' };
+
+            // AST of 'n>1', the expression of every plural form used below
+            var stub_jsep = function () {
+                return {
+                    type: 'BinaryExpression',
+                    operator: '>',
+                    left: n_node,
+                    right: { type: 'Literal', value: 1 }
+                };
+            };
+
+            var apples = function (i18n, locale, plural_forms) {
+                return i18n.setMessages('messages', locale, {
+                    '%1 apple': ['%1 pomme', '%1 pommes']
+                }, plural_forms);
+            };
+
+            it('should evaluate plural forms through the jsep option', function () {
+                var i18n = apples(new window.i18n({ locale: 'fr', jsep: stub_jsep }), 'fr', 'nplurals=2; plural=n>1;');
+                expect(i18n.ngettext('%1 apple', '%1 apples', 0, 0)).to.be('0 pomme');
+                expect(i18n.ngettext('%1 apple', '%1 apples', 1, 1)).to.be('1 pomme');
+                expect(i18n.ngettext('%1 apple', '%1 apples', 2, 2)).to.be('2 pommes');
+            });
+
+            it('should accept a parser given as an object with a parse method', function () {
+                var i18n = apples(new window.i18n({ locale: 'fr', jsep: { parse: stub_jsep } }), 'fr', 'nplurals=2; plural=n>1;');
+                expect(i18n.ngettext('%1 apple', '%1 apples', 2, 2)).to.be('2 pommes');
+            });
+
+            it('should pick a parser up from a global', function () {
+                window.jsep = stub_jsep;
+                try {
+                    var i18n = apples(new window.i18n({ locale: 'fr' }), 'fr', 'nplurals=2; plural=n>1;');
+                    expect(i18n.ngettext('%1 apple', '%1 apples', 2, 2)).to.be('2 pommes');
+                } finally {
+                    // note we cannot delete a global declared with var, hence the assignment
+                    window.jsep = undefined;
+                }
+            });
+
+            it('should not need the Function constructor when a parser is given', function () {
+                var RealFunction = window.Function,
+                    trap = function () { throw new Error('the Function constructor was used'); };
+
+                trap.prototype = RealFunction.prototype;
+                window.Function = trap;
+
+                try {
+                    var i18n = apples(new window.i18n({ locale: 'fr', jsep: stub_jsep }), 'fr', 'nplurals=2; plural=n>1;');
+                    expect(i18n.ngettext('%1 apple', '%1 apples', 2, 2)).to.be('2 pommes');
+                } finally {
+                    window.Function = RealFunction;
+                }
+            });
+
+            it('should fall back to the Function constructor when no parser is available', function () {
+                var RealFunction = window.Function,
+                    used = false,
+                    trap = function () { used = true; throw new Error('nope'); };
+
+                trap.prototype = RealFunction.prototype;
+                window.Function = trap;
+
+                try {
+                    var i18n = apples(new window.i18n({ locale: 'fr' }), 'fr', 'nplurals=2; plural=n>1;');
+                    try {
+                        i18n.ngettext('%1 apple', '%1 apples', 2, 2);
+                    } catch (e) {
+                        // the trap above, not a gettext.js error
+                    }
+                } finally {
+                    window.Function = RealFunction;
+                }
+
+                expect(used).to.be(true);
+            });
+
+            it('should reject invalid plural forms on the parser path too', function () {
+                var invalid = [
+                        'nplurals=2; plural=[not valid];',
+                        'nplurals=2; plural=n>1; console.log(`PWNED!`);'
+                    ],
+                    i, i18n, message;
+
+                for (i = 0; i < invalid.length; i++) {
+                    i18n = apples(new window.i18n({ locale: 'foo', jsep: stub_jsep }), 'foo', invalid[i]);
+                    message = null;
+                    try {
+                        i18n.ngettext('%1 apple', '%1 apples', 42, 42);
+                    } catch (e) {
+                        message = e.message;
+                    }
+                    expect(message).to.be('The plural form "' + invalid[i] + '" is not valid');
+                }
+            });
+
+            it('should reject a plural form the parser reads as several expressions', function () {
+                var compound = function () { return { type: 'Compound', body: [] }; },
+                    i18n = apples(new window.i18n({ locale: 'foo', jsep: compound }), 'foo', 'nplurals=2; plural=;'),
+                    message = null;
+
+                try {
+                    i18n.ngettext('%1 apple', '%1 apples', 42, 42);
+                } catch (e) {
+                    message = e.message;
+                }
+                expect(message).to.be('The plural form "nplurals=2; plural=;" is not valid');
+            });
+
+            it('should refuse an identifier other than n', function () {
+                var other_identifier = function () { return { type: 'Identifier', name: 'pwned' }; },
+                    i18n = apples(new window.i18n({ locale: 'foo', jsep: other_identifier }), 'foo', 'nplurals=2; plural=n;'),
+                    message = null;
+
+                try {
+                    i18n.ngettext('%1 apple', '%1 apples', 42, 42);
+                } catch (e) {
+                    message = e.message;
+                }
+
+                expect(message).to.be('Unknown identifier "pwned" in plural form expression');
+            });
+
+            it('should refuse a function call in a plural expression', function () {
+                var a_call = function () { return { type: 'CallExpression', callee: n_node, arguments: [] }; },
+                    i18n = apples(new window.i18n({ locale: 'foo', jsep: a_call }), 'foo', 'nplurals=2; plural=n;'),
+                    message = null;
+
+                try {
+                    i18n.ngettext('%1 apple', '%1 apples', 42, 42);
+                } catch (e) {
+                    message = e.message;
+                }
+
+                expect(message).to.be('Unsupported expression "CallExpression" in plural form');
+            });
+
+            it('should parse a plural form only once per locale', function () {
+                var parses = 0,
+                    counting = function (expression) { parses++; return stub_jsep(expression); },
+                    i18n = apples(new window.i18n({ locale: 'fr', jsep: counting }), 'fr', 'nplurals=2; plural=n>1;'),
+                    n;
+
+                for (n = 0; n < 20; n++) {
+                    i18n.ngettext('%1 apple', '%1 apples', n, n);
+                }
+
+                expect(parses).to.be(1);
+            });
+        });
     });
 }());
