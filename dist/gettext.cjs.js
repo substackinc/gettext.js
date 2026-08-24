@@ -30,7 +30,8 @@ var i18n = function (options) {
    _domain = options.domain || defaults.domain,
    _dictionary = {},
    _plural_forms = {},
-   _ctxt_delimiter = options.ctxt_delimiter || defaults.ctxt_delimiter;
+   _ctxt_delimiter = options.ctxt_delimiter || defaults.ctxt_delimiter,
+   _jsep = options.jsep;
 
    if (options.messages) {
      _dictionary[_domain] = {};
@@ -88,6 +89,103 @@ var i18n = function (options) {
       return locale;
    };
 
+   // jsep (https://github.com/soney/jsep) is a JavaScript expression parser that we optionally use to evaluate plural
+   // forms when it is available. When it isn't we use `new Function()`, which is less safe as it allows arbitrary
+   // JavaScript to be injected into plural forms.
+   var resolveJsep = function (candidate) {
+     if (!candidate)
+       return false;
+
+     // jsep's default export is directly callable, an ESM namespace object is not
+     if ('function' === typeof candidate)
+       return candidate;
+
+     if ('function' === typeof candidate.default)
+       return candidate.default;
+
+     if ('function' === typeof candidate.parse)
+       return function (expression) { return candidate.parse(expression); };
+
+     return false;
+   };
+
+   var getJsep = function () {
+     var global_scope =
+       'undefined' !== typeof globalThis ? globalThis :
+       'undefined' !== typeof window ? window :
+       'undefined' !== typeof self ? self : false;
+
+     return resolveJsep(_jsep) || resolveJsep(global_scope && global_scope.jsep);
+   };
+
+   // A plural form is a C expression, and gettext parses it with the grammar in
+   // gettext-runtime/intl/plural.y, which accepts these operators and no others:
+   // the ?: ternary, || && !, == !=, < > <= >=, + -, * / %, plus n, integers and parentheses.
+   // That grammar notes "there is no unary minus and no bitwise operators", so anything jsep
+   // may additionally recognise (=== ?? ** ~ and the bitwise and shift operators) is refused.
+   // && and || live in evalPluralNode instead, as they have to keep short circuiting
+   var plural_binary_ops = {
+     '==': function (l, r) { return l == r; },
+     '!=': function (l, r) { return l != r; },
+     '<':  function (l, r) { return l < r; },
+     '>':  function (l, r) { return l > r; },
+     '<=': function (l, r) { return l <= r; },
+     '>=': function (l, r) { return l >= r; },
+     '+':  function (l, r) { return l + r; },
+     '-':  function (l, r) { return l - r; },
+     '*':  function (l, r) { return l * r; },
+     '/':  function (l, r) { return l / r; },
+     '%':  function (l, r) { return l % r; }
+   };
+
+   var plural_unary_ops = {
+     '!': function (v) { return !v; }
+   };
+
+   var evalPluralNode = function (node, n) {
+     if (!node || 'string' !== typeof node.type)
+       throw new Error('Malformed plural form expression');
+
+     if ('Literal' === node.type)
+       return node.value;
+
+     if ('Identifier' === node.type) {
+       if ('n' !== node.name)
+         throw new Error(strfmt('Unknown identifier "%1" in plural form expression', node.name));
+
+       return n;
+     }
+
+     if ('UnaryExpression' === node.type) {
+       if (!plural_unary_ops[node.operator])
+         throw new Error(strfmt('Unsupported operator "%1" in plural form expression', node.operator));
+
+       return plural_unary_ops[node.operator](evalPluralNode(node.argument, n));
+     }
+
+     // jsep up to 1.3 reports && and || as LogicalExpression, 1.4 and later as BinaryExpression
+     if ('BinaryExpression' === node.type || 'LogicalExpression' === node.type) {
+       if ('&&' === node.operator)
+         return evalPluralNode(node.left, n) && evalPluralNode(node.right, n);
+
+       if ('||' === node.operator)
+         return evalPluralNode(node.left, n) || evalPluralNode(node.right, n);
+
+       if (!plural_binary_ops[node.operator])
+         throw new Error(strfmt('Unsupported operator "%1" in plural form expression', node.operator));
+
+       return plural_binary_ops[node.operator](evalPluralNode(node.left, n), evalPluralNode(node.right, n));
+     }
+
+     if ('ConditionalExpression' === node.type)
+       return evalPluralNode(node.test, n) ? evalPluralNode(node.consequent, n) : evalPluralNode(node.alternate, n);
+
+     throw new Error(strfmt('Unsupported expression "%1" in plural form', node.type));
+   };
+
+   // Pulls the plural count and the plural expression out of an already validated plural form
+   var pf_parts_re = /^\s*nplurals\s*=\s*([0-9]+)\s*;\s*plural\s*=\s*([\s\S]*?)\s*;*\s*$/;
+
    var getPluralFunc = function (plural_form) {
      // Plural form string regexp
      // taken from https://github.com/Orange-OpenSource/gettext.js/blob/master/lib.gettext.js
@@ -97,10 +195,37 @@ var i18n = function (options) {
      if (!pf_re.test(plural_form))
        throw new Error(strfmt('The plural form "%1" is not valid', plural_form));
 
-     // Careful here, this is a hidden eval() equivalent..
+     var jsep = getJsep();
+
+     // Preferred path: parse the expression once, then walk that AST on every call. No
+     // eval() equivalent is involved, so a CSP without 'unsafe-eval' is enough
+     if (jsep) {
+       var nplurals, ast;
+
+       try {
+         var parts = plural_form.match(pf_parts_re);
+         nplurals = parseInt(parts[1], 10);
+         ast = jsep(parts[2]);
+       } catch (e) {
+         throw new Error(strfmt('The plural form "%1" is not valid', plural_form));
+       }
+
+       // jsep answers with an empty Compound for an empty expression, and with a filled one
+       // for anything it read as several expressions in a row
+       if ('Compound' === ast.type)
+         throw new Error(strfmt('The plural form "%1" is not valid', plural_form));
+
+       return function (n) {
+         var plural = evalPluralNode(ast, n);
+
+         return { nplurals: nplurals, plural: (plural === true ? 1 : (plural ? plural : 0)) };
+       };
+     }
+
+     // Fallback for when jsep is not available. Careful here, this is a hidden eval() equivalent
+     // and it does need CSP 'unsafe-eval': pass the jsep option to stay clear of it.
      // Risk should be reasonable though since we test the plural_form through regex before
      // taken from https://github.com/Orange-OpenSource/gettext.js/blob/master/lib.gettext.js
-     // TODO: should test if https://github.com/soney/jsep present and use it if so
      return new Function("n", 'var plural, nplurals; '+ plural_form +' return { nplurals: nplurals, plural: (plural === true ? 1 : (plural ? plural : 0)) };');
    };
 

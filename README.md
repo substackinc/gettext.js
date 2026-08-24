@@ -142,6 +142,44 @@ or without variables
 `gettext('My credit card has an interest rate of %%20');` -> "My credit card has an interest rate of %20"
 
 
+### Content Security Policy and `unsafe-eval`
+
+Working out which plural form applies to a given `n` means evaluating the plural expression
+that came with your translations (`nplurals=2; plural=n>1;`). By default that goes through the
+`Function` constructor, which a Content Security Policy only allows with `unsafe-eval`.
+
+To avoid needing `unsafe-eval`, add [jsep](https://github.com/EricSmekens/jsep) to your project
+and pass it in. It parses the expression into a syntax tree that gettext.js walks itself, so the
+`Function` constructor is never reached:
+
+```javascript
+var jsep = require('jsep');
+
+var i18n = require('gettext.js')({ jsep: jsep });
+```
+
+In the browser, loading jsep's own build with a `<script>` tag is enough, since it exposes
+itself as `window.jsep` and gettext.js picks it up from there.
+
+jsep is optional: it is declared as an optional peer dependency, and without it gettext.js falls
+back to the `Function` constructor as before. Note the option is per instance, so every instance
+you create needs it, and the expression is parsed once per locale rather than on every call.
+
+A plural form is a C expression, and gettext parses it with the grammar in
+[`gettext-runtime/intl/plural.y`](https://git.savannah.gnu.org/cgit/gettext.git/tree/gettext-runtime/intl/plural.y).
+The tree walker accepts exactly what that grammar accepts and nothing else: the `? :` ternary,
+`||` `&&` `!`, `==` `!=`, `<` `>` `<=` `>=`, `+` `-`, `*` `/` `%`, plus `n`, integers and
+parentheses. `n` is the only identifier allowed. JavaScript operators that C does not have are
+refused, among them `===`, `!==`, `??`, `**`, `~`, the bitwise and shift operators, and unary
+`-` and `+` — that grammar says as much itself, in a comment reading "there is no unary minus
+and no bitwise operators".
+
+Because the plural form regular expression matches a prefix rather than the whole string, a
+form carrying trailing junk gets past it, and the `Function` constructor fallback will happily
+run that junk. The jsep path turns such a form down instead, so passing jsep closes that hole
+as well as removing the need for `unsafe-eval`.
+
+
 ## Required JSON format
 
 You'll find in `/bin` a `po2json.js` converter, based on the excellent
